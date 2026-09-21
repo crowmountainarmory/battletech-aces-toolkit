@@ -40,6 +40,7 @@ Screen structures for card browser and card creator.
 Route-level assembly and data wiring only.
 
 **Rule:** put data fetching/orchestration in composables/application services, not in leaf components.
+**Rule:** Enforce tailwind css styles wherever possible and eschew custom classes.
 
 ---
 
@@ -60,13 +61,37 @@ Applied to this app:
 ## 5. Domain Model (Initial)
 
 ### Core Entities
-- **Card**: identity, metadata, tags, abilities, rule references, version.
-- **Deck**: identity, name, card IDs/order, faction/constraints, version.
+- **Movement Card**: UUID identity, unit role, and a default order number. Each has 1-4 ordered Movement Filters, grouped by aggressive/balanced/cautious profile.
+- **Movement Filter**: a labeled filter belonging to one Movement Card and profile, with an optional single condition string, a movement type (`G` Ground, `J` Jump, `S` Sprint, `H` Standstill), and an ordered list of Movement Filter Actions.
+- **Movement Filter Action**: an ordered action within a Movement Filter, applied after the filter's movement type. Each action references a `movement`-typed Rule Filter.
+- **Combat Card**: UUID identity, role, overheat, and a default order number. Its target behavior is an ordered Rule Filter list.
+- **Commander Card**: UUID identity, commander name, faction, and one or more commander modes.
+- **Commander Mode**: per-commander configuration identified by a single-character mode (such as `A`, `B`, `C`) plus orders, ordered Rule Filter target groups, support orders, and strategy decisions.
+- **Deck**: UUID identity, name, a single assigned commander, timestamps, and recent-use metadata.
+- **Rule Filter**: a preset rule reference with a stable UUID/key and a `movement` or `combat` type, reusable across many cards and modes.
 - **Rule**: trigger, conditions, effects, priority, dependencies, scope.
 - **Simulation Profile** (future): external mapping and run configuration.
 
 ### Value Objects
 - RuleCondition, RuleEffect, RulePriority, CardReference, DeckConstraint, EvaluationContext.
+
+### Relationship Rules
+- All persisted primary identifiers use UUIDs.
+- Movement, Combat, and Commander are distinct card types with separate DTOs and storage concerns.
+- Deck and Card use a **many-to-many** relationship, but deck composition is specialized by card type.
+- Each Deck has exactly one Commander Card reference.
+- Each Commander Card can contain many Commander Modes.
+- Movement Filters belong to exactly one Movement Card and are grouped/ordered by profile (aggressive/balanced/cautious), with up to 4 filters per card.
+- Movement Filter Actions belong to exactly one Movement Filter and are ordered many-to-many references to `movement`-typed Rule Filters.
+- Combat card target entries are ordered many-to-many references to Rule Filters.
+- Commander mode red/yellow/blue/emplacement/artillery/BSP target entries are ordered many-to-many references to Rule Filters.
+- Movement profile links may only reference `movement` Rule Filters.
+- Combat card and commander target-group links may only reference `combat` Rule Filters.
+- Each Deck has many Movement/Combat pairs.
+- Inside a Deck, Movement and Combat cards are associated in a **1:1 pair record**.
+- A Movement card in a Deck must always be paired to exactly one Combat card.
+- Pair membership must be represented with an explicit join model so card reuse, ordering, and pair-level metadata can evolve without changing the Deck record shape.
+- There is no theoretical hard limit on Movement/Combat pairs per Deck, but UI layouts should optimize for the common case of roughly 12 units.
 
 ---
 
@@ -74,11 +99,12 @@ Applied to this app:
 
 ## 6.1 Pipeline
 1. **Normalize input** (deck + context).
-2. **Resolve active rules** (trigger/condition checks).
-3. **Build dependency graph** among rules/effects.
-4. **Topologically order** rule execution by dependency + priority.
-5. **Apply effects** deterministically to an immutable state snapshot chain.
-6. **Emit evaluation result** (final state + trace + warnings/conflicts).
+2. **Expand deck composition** into commander context plus movement/combat pair instances.
+3. **Resolve active rules** (trigger/condition checks).
+4. **Build dependency graph** among rules/effects.
+5. **Topologically order** rule execution by dependency + priority.
+6. **Apply effects** deterministically to an immutable state snapshot chain.
+7. **Emit evaluation result** (final state + trace + warnings/conflicts).
 
 ## 6.2 Conflict/Dependency Policy
 - Priority first, dependency second, stable tie-breaker third.
@@ -98,25 +124,52 @@ Persist optional evaluation traces for replay/debugging:
 ## 7. IndexedDB Architecture
 
 ## 7.1 Object Stores (initial)
-- `cards`
+- `movementCards`
+- `combatCards`
+- `commanderCards`
+- `commanderModes`
+- `ruleFilters`
+- `movementFilters`
+- `movementFilterActions`
+- `combatCardRuleFilterLinks`
+- `commanderModeRuleFilterLinks`
 - `decks`
+- `deckMovementCombatPairs`
 - `rules`
 - `cardRuleLinks`
 - `simulationProfiles` (future-ready)
 - `metadata` (schema/app metadata)
 
 ## 7.2 Indexing (initial)
-- cards by `name`, `tags`, `updatedAt`
-- decks by `name`, `updatedAt`
+- movement cards by `unitRole`, `defaultOrderNumber`, `updatedAt`
+- combat cards by `role`, `defaultOrderNumber`, `updatedAt`
+- commander cards by `name`, `faction`, `updatedAt`
+- commander modes by `commanderCardId`, `mode`
+- rule filters by `type`, `key`, `label`
+- movement filters by `movementCardId`, `movementCardId + profile + sortOrder`
+- movement filter actions by `movementFilterId`, `movementFilterId + sortOrder`
+- combat-card rule-filter links by `combatCardId`, `ruleFilterId`, `combatCardId + filterGroup + sortOrder`
+- commander-mode rule-filter links by `commanderModeId`, `ruleFilterId`, `commanderModeId + filterGroup + sortOrder`
+- decks by `name`, `updatedAt`, `lastUsedAt`
+- deck movement/combat pairs by `deckId`, `movementCardId`, `combatCardId`, `deckId + movementOrderNumber`
 - rules by `trigger`, `priority`, `updatedAt`
 - link table by `cardId`, `ruleId`
 
-## 7.3 Repository Pattern
+## 7.3 DTO Modeling Guidance
+- Store Movement and Combat cards independently so they can be authored and reused separately.
+- Store Commander Modes separately from Commander Cards so one commander can expose many modes without duplicating name/faction data.
+- Store Rule Filters in their own table and reference them through ordered join records rather than duplicating rule text inside cards.
+- Use separate ordered join DTOs for each owner/group combination so movement profiles and commander target groups remain explicit and queryable.
+- Use Rule Filter `type` as a validation guard so movement profiles cannot accidentally consume combat filters and vice versa.
+- Treat card-level order numbers as **defaults/templates**.
+- Treat deck pair order numbers as **deck-instance values** so reused cards can participate in different decks without mutation.
+
+## 7.4 Repository Pattern
 - Application layer calls repository interfaces.
 - Infrastructure layer implements IndexedDB details and migrations.
 - Domain/application never depend on IndexedDB APIs directly.
 
-## 7.4 Versioning and Migrations
+## 7.5 Versioning and Migrations
 - Maintain explicit schema versions.
 - Forward migrations must be deterministic and idempotent.
 - Never silently drop data on migration failure; surface actionable errors.
@@ -157,6 +210,7 @@ src/
     indexeddb/
       schema/
       repositories/
+      dto/
     integrations/
       mekbay/
   rules-engine/
@@ -178,4 +232,3 @@ src/
 
 ## 11. Alignment Reference
 Role boundaries and interaction ownership are defined in [Agents.md](./Agents.md).
-
